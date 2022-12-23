@@ -73,6 +73,7 @@ function makeEnv(secrets: Secrets, repo: Repo) {
         tmpDir: fs.mkdtempSync(path.join(os.tmpdir(), "publisher-out-")),
         tmpGpg: fs.mkdtempSync(path.join(os.tmpdir(), "publisher-gpg-home-")),
         tmpOut: path.join(os.tmpdir(), `pub-out-${crypto.randomBytes(16).toString("hex")}.tar.gz`),
+        tmpEnc: path.join(os.tmpdir(), `pub-out-${crypto.randomBytes(16).toString("hex")}.tar.gz.enc`),
         gpgBase: '.secrets/gnupg/',
         pubring: function () {
             return `${this.gpgBase}/pubring.gpg`;
@@ -182,7 +183,36 @@ async function setupSbtSonatype(env: Env) {
             task.once('finish', resolve);
         });
 
-        await run("openssl", ["aes-256-cbc", "-K", env.eKey, "-iv", env.eIv, "-in", env.tmpOut, "-out", "secrets.tar.enc"]);
+        await run("openssl", ["aes-256-cbc", "-K", env.eKey, "-iv", env.eIv, "-in", env.tmpOut, "-out", env.tmpEnc]);
+
+        const data = fs.readFileSync(env.tmpEnc);
+        const content = Buffer.from(data).toString('base64');
+
+        const target = "secrets.tar.enc";
+        var sha: string | undefined = ""
+        try {
+            const data = await env.octokit.request(`GET /repos/{owner}/{repo}/contents/{file_path}`, {
+                ...env.repo,
+                file_path: target,
+            });
+            sha = data.data.sha;
+        } catch (e) {
+            sha = undefined;
+        }
+
+
+        console.debug(sha);
+        await env.octokit.rest.repos.createOrUpdateFileContents({
+            ...env.repo,
+            path: target,
+            message: `Secrets updated by https://github.com/7mind/ghpub`,
+            content: content,
+            sha: sha,
+        })
+
+        const rpk = await getRepoKey(env);
+        await setupSecret(rpk, "OPENSSL_KEY", env.eKey, env);
+        await setupSecret(rpk, "OPENSSL_IV", env.eIv, env);
 
         const keys = (await run("gpg", ["--homedir", env.tmpGpg, "--list-keys", "--with-colons"])).split('\n').map(line => line.split(":")).filter(line => line[0] == "fpr").map(line => line[9]);
 
@@ -195,13 +225,10 @@ async function setupSbtSonatype(env: Env) {
             }
         }
 
-        const rpk = await getRepoKey(env);
-        await setupSecret(rpk, "OPENSSL_KEY", env.eKey, env);
-        await setupSecret(rpk, "OPENSSL_IV", env.eIv, env);
         fs.rmSync(env.tmpDir, { recursive: true });
         fs.rmSync(env.tmpGpg, { recursive: true });
         fs.rmSync(env.tmpOut);
-
+        fs.rmSync(env.tmpEnc);
     } catch (e) {
         console.log(e);
     }
