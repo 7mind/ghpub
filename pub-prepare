@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 
-exec npx ts-node -T pub-prepare.ts $*
+
+exec npx ts-node-esm pub-prepare.ts $*

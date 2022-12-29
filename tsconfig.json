@@ -1,0 +1,12 @@
+{
+    "extends": "@tsconfig/node16/tsconfig.json",
+    "ts-node": {
+        "transpileOnly": true,
+        "esm": true,
+        "files": true,
+        "compilerOptions": {}
+    },
+    "compilerOptions": {
+        "module": "ESNext" // or ES2015, ES2020
+    },
+}

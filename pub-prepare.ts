@@ -8,6 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import vaultClient from "node-vault";
+import yargs, { exit } from 'yargs';
+import { hideBin } from 'yargs/helpers';
+import inquirer from "inquirer";
 
 type Assert = (condition: unknown, clue: string) => asserts condition;
 const assert: Assert = (condition, clue) => {
@@ -55,6 +58,56 @@ async function readVault(): Promise<Secrets> {
         nugetToken: (await vault.read("secret/nuget")).data.token,
     }
 };
+
+async function readSecret(name: string) {
+    const out = await inquirer.prompt([
+        {
+            type: 'password',
+            name: 'secret',
+            message: `Enter ${name}:`,
+            mask: '*',
+        }
+    ]);
+    return out.secret;
+}
+
+async function readInput(name: string) {
+    const out = await inquirer.prompt([
+        {
+            type: 'input',
+            name: 'input',
+            message: `Enter ${name}:`,
+        }
+    ]);
+    return out.input;
+}
+async function readSecrets(sonatype: boolean, nuget: boolean): Promise<Secrets> {
+
+    var sonatypeUser = "";
+    var sonatypeEmail = "";
+    var sonatypePassword = "";
+
+    var nugetToken = "";
+
+    const githubKey = await readSecret("Github Token");
+
+    if (sonatype) {
+        sonatypeUser = await readInput("Sonatype Username");
+        sonatypeEmail = await readInput("Sonatype email");
+        sonatypePassword = await readSecret("Sonatype Password");
+    }
+    if (nuget) {
+        nugetToken = await readSecret("Nuget Token");
+    }
+    return {
+        sonatypeLogin: sonatypeUser,
+        sonatypePassword: sonatypePassword,
+        sonatypeEmail: sonatypeEmail,
+        githubKey: githubKey,
+        nugetToken: nugetToken,
+    }
+};
+
 
 type Repo = {
     owner: string,
@@ -239,19 +292,60 @@ async function setupNuget(env: Env) {
     await setupSecret(rpk, "NUGET_TOKEN", env.secrets.nugetToken, env);
 }
 async function main() {
-    if (process.argv.length != 4) {
-        panic("Expected exactly two arguments: REPO_OWNER REPO_NAME, e.g. pub-prepare 7mind sick");
-    }
+    const argv = await yargs(hideBin(process.argv)).options({
+        owner: { type: 'string', demandOption: true },
+        repo: { type: 'string', demandOption: true },
+        useVault: { type: 'boolean', default: true },
+        setupSonatype: { type: 'boolean', default: true },
+        setupNuget: { type: 'boolean', default: true },
+    }).argv;
 
-    const secrets = await readVault();
     const repo = {
-        owner: process.argv[2],
-        repo: process.argv[3],
+        owner: argv.owner,
+        repo: argv.repo,
     }
-    const env = makeEnv(secrets, repo);
 
-    await setupSbtSonatype(env);
-    await setupNuget(env);
+    console.log(`* Will operate on ${JSON.stringify(repo)}`);
+
+    if (argv.setupSonatype) {
+        console.log("* Will commit encrypted Sonatype secrets archive");
+        console.log("* Will add decryption tokens into Github secrets");
+    }
+    if (argv.setupNuget) {
+        console.log("* Will add Nuget token into Github secrets");
+    }
+
+    const response = await inquirer.prompt([
+        {
+            type: 'confirm',
+            name: 'continue',
+            message: 'Continue?'
+        }
+    ]);
+
+    if (!response.continue) {
+        process.exit(0)
+    }
+
+    const secrets = await (() => {
+        if (argv.useVault) {
+            return readVault();
+        } else {
+            return readSecrets(argv.setupSonatype, argv.setupNuget);
+        }
+    })();
+
+    console.debug(secrets);
+    process.exit(1);
+    const env = makeEnv(secrets, repo);
+    if (argv.setupSonatype) {
+        console.log("Setting up sonatype secrets...")
+        await setupSbtSonatype(env);
+    }
+    if (argv.setupNuget) {
+        console.log("Adding nuget key...")
+        await setupNuget(env);
+    }
 }
 
 main()
