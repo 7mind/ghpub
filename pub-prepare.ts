@@ -34,29 +34,44 @@ type Secrets = {
     sonatypeEmail: string;
     nugetToken: string;
 }
-async function readVault(): Promise<Secrets> {
-    const endpoint = process.env.VAULT_ADDR ?? "";
-    if (endpoint.length == 0) {
-        panic("VAULT_ADDR variable is unset");
-    }
+async function readVault(endpoint: string, path: string): Promise<Secrets> {
     const vault = vaultClient({
         apiVersion: "v1",
         endpoint: endpoint,
+        //debug: console.log,
     });
 
-    vault.token = process.env.VAULT_TOKEN ?? "";
+
     if (vault.token.length == 0) {
         panic("VAULT_TOKEN variable is unset");
     }
 
-    const sonatype = await vault.read("secret/sonatype");
+    //console.debug(await vault.write(`${path}/test`, { data: { key: "value" } }));
+
+    const sonatype = (await vault.read(`${path}/sonatype`)).data;
+
     return {
         sonatypeLogin: sonatype.data.user,
         sonatypePassword: sonatype.data.password,
         sonatypeEmail: sonatype.data.email,
-        githubKey: (await vault.read("secret/github")).data.token,
-        nugetToken: (await vault.read("secret/nuget")).data.token,
+        githubKey: (await vault.read(`${path}/github`)).data.data.token,
+        nugetToken: (await vault.read(`${path}/nuget`)).data.data.token,
     }
+};
+async function writeVault(endpoint: string, path: string, secrets: Secrets): Promise<void> {
+    const vault = vaultClient({
+        apiVersion: "v1",
+        endpoint: endpoint,
+        //debug: console.log,
+    });
+
+    if (vault.token.length == 0) {
+        panic("VAULT_TOKEN variable is unset");
+    }
+
+    await vault.write(`${path}/sonatype`, { data: { user: secrets.sonatypeLogin, password: secrets.sonatypePassword, email: secrets.sonatypeEmail } });
+    await vault.write(`${path}/github`, { data: { token: secrets.githubKey } });
+    await vault.write(`${path}/nuget`, { data: { token: secrets.nugetToken } });
 };
 
 async function readSecret(name: string) {
@@ -254,7 +269,11 @@ async function setupSbtSonatype(env: Env) {
         }
 
 
-        console.debug(sha);
+        if (sha != undefined) {
+            console.log(`Will update existing ${target} with sha=${sha}...`);
+        } else {
+            console.log(`Will commit new ${target}...`);
+        }
         await env.octokit.rest.repos.createOrUpdateFileContents({
             ...env.repo,
             path: target,
@@ -262,10 +281,13 @@ async function setupSbtSonatype(env: Env) {
             content: content,
             sha: sha,
         })
+        console.log("...done")
 
+        console.log(`Setting up decryption keys...`);
         const rpk = await getRepoKey(env);
         await setupSecret(rpk, "OPENSSL_KEY", env.eKey, env);
         await setupSecret(rpk, "OPENSSL_IV", env.eIv, env);
+        console.log("...done")
 
         const keys = (await run("gpg", ["--homedir", env.tmpGpg, "--list-keys", "--with-colons"])).split('\n').map(line => line.split(":")).filter(line => line[0] == "fpr").map(line => line[9]);
 
@@ -277,6 +299,8 @@ async function setupSbtSonatype(env: Env) {
                 await run("gpg", ["--homedir", env.tmpGpg, "--send-keys", "--keyserver", servers[server], keys[key]]);
             }
         }
+        console.log("...done")
+
 
         fs.rmSync(env.tmpDir, { recursive: true });
         fs.rmSync(env.tmpGpg, { recursive: true });
@@ -288,16 +312,21 @@ async function setupSbtSonatype(env: Env) {
 }
 
 async function setupNuget(env: Env) {
+    console.log(`Setting up nuget token...`);
     const rpk = await getRepoKey(env);
     await setupSecret(rpk, "NUGET_TOKEN", env.secrets.nugetToken, env);
+    console.log("...done")
 }
 async function main() {
     const argv = await yargs(hideBin(process.argv)).options({
         owner: { type: 'string', demandOption: true },
         repo: { type: 'string', demandOption: true },
-        useVault: { type: 'boolean', default: true },
+        readVault: { type: 'boolean', default: true },
         setupSonatype: { type: 'boolean', default: true },
         setupNuget: { type: 'boolean', default: true },
+        vaultPath: { type: 'string', default: "ghpub/data" },
+        vaultAddress: { type: 'string', default: process.env.VAULT_ADDR ?? "" },
+        writeVault: { type: 'boolean', default: false },
     }).argv;
 
     const repo = {
@@ -314,6 +343,31 @@ async function main() {
     if (argv.setupNuget) {
         console.log("* Will add Nuget token into Github secrets");
     }
+    if (argv.readVault) {
+        if (argv.vaultAddress.length == 0) {
+            panic("VAULT_ADDR variable is unset");
+        }
+        console.log(`* Will read secrets from ${argv.vaultPath} on ${argv.vaultAddress}`);
+    }
+    if (argv.writeVault && !argv.readVault) {
+        console.log(`* Will read secrets from terminal and write them into ${argv.vaultPath} on ${argv.vaultAddress}`);
+    }
+
+    const secrets = await (() => {
+        if (argv.readVault) {
+            return readVault(argv.vaultAddress, argv.vaultPath);
+        } else {
+            return readSecrets(argv.setupSonatype, argv.setupNuget);
+        }
+    })();
+
+    console.log("! Obtained the secrets");
+
+    if (argv.writeVault && !argv.readVault) {
+        console.log("* Will fill the vault now...");
+        await writeVault(argv.vaultAddress, argv.vaultPath, secrets);
+        console.log("* Done");
+    }
 
     const response = await inquirer.prompt([
         {
@@ -327,16 +381,6 @@ async function main() {
         process.exit(0)
     }
 
-    const secrets = await (() => {
-        if (argv.useVault) {
-            return readVault();
-        } else {
-            return readSecrets(argv.setupSonatype, argv.setupNuget);
-        }
-    })();
-
-    console.debug(secrets);
-    process.exit(1);
     const env = makeEnv(secrets, repo);
     if (argv.setupSonatype) {
         console.log("Setting up sonatype secrets...")
