@@ -33,6 +33,7 @@ type Secrets = {
     sonatypePassword: string;
     sonatypeEmail: string;
     nugetToken: string;
+    codecovToken: string;
 }
 async function readVault(endpoint: string, path: string): Promise<Secrets> {
     const vault = vaultClient({
@@ -56,6 +57,7 @@ async function readVault(endpoint: string, path: string): Promise<Secrets> {
         sonatypeEmail: sonatype.data.email,
         githubKey: (await vault.read(`${path}/github`)).data.data.token,
         nugetToken: (await vault.read(`${path}/nuget`)).data.data.token,
+        codecovToken: (await vault.read(`${path}/codecov`)).data.data.token,
     }
 };
 async function writeVault(endpoint: string, path: string, secrets: Secrets): Promise<void> {
@@ -96,13 +98,14 @@ async function readInput(name: string) {
     ]);
     return out.input;
 }
-async function readSecrets(sonatype: boolean, nuget: boolean): Promise<Secrets> {
+async function readSecrets(sonatype: boolean, nuget: boolean, codecov: boolean): Promise<Secrets> {
 
     var sonatypeUser = "";
     var sonatypeEmail = "";
     var sonatypePassword = "";
 
     var nugetToken = "";
+    var codecovToken = "";
 
     const githubKey = await readSecret("Github Token");
 
@@ -114,12 +117,16 @@ async function readSecrets(sonatype: boolean, nuget: boolean): Promise<Secrets> 
     if (nuget) {
         nugetToken = await readSecret("Nuget Token");
     }
+    if (codecov) {
+        codecovToken = await readSecret("Codecov Token");
+    }
     return {
         sonatypeLogin: sonatypeUser,
         sonatypePassword: sonatypePassword,
         sonatypeEmail: sonatypeEmail,
         githubKey: githubKey,
         nugetToken: nugetToken,
+        codecovToken: codecovToken,
     }
 };
 
@@ -200,6 +207,14 @@ async function run(cmd: string, args: Array<string>) {
     });
 }
 
+async function setupSbtSonatypeKeys(env: Env) {
+    console.log(`Setting up decryption keys...`);
+    const rpk = await getRepoKey(env);
+    await setupSecret(rpk, "OPENSSL_KEY", env.eKey, env);
+    await setupSecret(rpk, "OPENSSL_IV", env.eIv, env);
+    console.log("...done")
+}
+
 async function setupSbtSonatype(env: Env) {
     try {
         const gpgBase = path.join(env.tmpDir, env.gpgBase);
@@ -253,9 +268,34 @@ async function setupSbtSonatype(env: Env) {
 
         await run("openssl", ["aes-256-cbc", "-K", env.eKey, "-iv", env.eIv, "-in", env.tmpOut, "-out", env.tmpEnc]);
 
+
+
+        const keys = (await run("gpg", ["--homedir", env.tmpGpg, "--list-keys", "--with-colons"])).split('\n').map(line => line.split(":")).filter(line => line[0] == "fpr").map(line => line[9]);
+
+        //const servers = ["keyserver.ubuntu.com", "pgp.mit.edu", "keys.openpgp.org"];
+        const servers = ["keyserver.ubuntu.com"];
+
+        console.log(`Going to upload ${keys} to ${servers}`);
+
+        var count = 0
+        for (let key in keys) {
+            for (let server in servers) {
+                try {
+                    await run("gpg", ["--homedir", env.tmpGpg, "--send-keys", "--keyserver", servers[server], keys[key]]);
+                    count += 1
+                } catch (e) {
+                    console.log(`Failed to upload key to ${server} but that's not critical`)
+                }
+            }
+        }
+        if (count > 0) {
+            console.log("The GPG key is uploaded to at least one server, continuing")
+        } else {
+            panic("Failed to upload GPG key to any of the servers")
+        }
+
         const data = fs.readFileSync(env.tmpEnc);
         const content = Buffer.from(data).toString('base64');
-
         const target = "secrets.tar.enc";
         var sha: string | undefined = ""
         try {
@@ -267,8 +307,6 @@ async function setupSbtSonatype(env: Env) {
         } catch (e) {
             sha = undefined;
         }
-
-
         if (sha != undefined) {
             console.log(`Will update existing ${target} with sha=${sha}...`);
         } else {
@@ -281,24 +319,6 @@ async function setupSbtSonatype(env: Env) {
             content: content,
             sha: sha,
         })
-        console.log("...done")
-
-        console.log(`Setting up decryption keys...`);
-        const rpk = await getRepoKey(env);
-        await setupSecret(rpk, "OPENSSL_KEY", env.eKey, env);
-        await setupSecret(rpk, "OPENSSL_IV", env.eIv, env);
-        console.log("...done")
-
-        const keys = (await run("gpg", ["--homedir", env.tmpGpg, "--list-keys", "--with-colons"])).split('\n').map(line => line.split(":")).filter(line => line[0] == "fpr").map(line => line[9]);
-
-        const servers = ["keys.openpgp.org", "keyserver.ubuntu.com", "pgp.mit.edu"];
-        console.log(`Going to upload ${keys} to ${servers}`);
-
-        for (let key in keys) {
-            for (let server in servers) {
-                await run("gpg", ["--homedir", env.tmpGpg, "--send-keys", "--keyserver", servers[server], keys[key]]);
-            }
-        }
         console.log("...done")
 
 
@@ -314,9 +334,17 @@ async function setupSbtSonatype(env: Env) {
 async function setupNuget(env: Env) {
     console.log(`Setting up nuget token...`);
     const rpk = await getRepoKey(env);
-    await setupSecret(rpk, "NUGET_TOKEN", env.secrets.nugetToken, env);
+    await setupSecret(rpk, "TOKEN_NUGET", env.secrets.nugetToken, env);
     console.log("...done")
 }
+
+async function setupCodecov(env: Env) {
+    console.log(`Setting up nuget token...`);
+    const rpk = await getRepoKey(env);
+    await setupSecret(rpk, "TOKEN_CODECOV", env.secrets.codecovToken, env);
+    console.log("...done")
+}
+
 async function main() {
     const argv = await yargs(hideBin(process.argv)).options({
         owner: { type: 'string', demandOption: true },
@@ -324,6 +352,7 @@ async function main() {
         readVault: { type: 'boolean', default: true },
         setupSonatype: { type: 'boolean', default: true },
         setupNuget: { type: 'boolean', default: true },
+        setupCodecov: { type: 'boolean', default: true },
         vaultPath: { type: 'string', default: "ghpub/data" },
         vaultAddress: { type: 'string', default: process.env.VAULT_ADDR ?? "" },
         writeVault: { type: 'boolean', default: false },
@@ -343,6 +372,9 @@ async function main() {
     if (argv.setupNuget) {
         console.log("* Will add Nuget token into Github secrets");
     }
+    if (argv.setupCodecov) {
+        console.log("* Will add Codecov token into Github secrets");
+    }
     if (argv.readVault) {
         if (argv.vaultAddress.length == 0) {
             panic("VAULT_ADDR variable is unset");
@@ -357,7 +389,7 @@ async function main() {
         if (argv.readVault) {
             return readVault(argv.vaultAddress, argv.vaultPath);
         } else {
-            return readSecrets(argv.setupSonatype, argv.setupNuget);
+            return readSecrets(argv.setupSonatype, argv.setupNuget, argv.setupCodecov);
         }
     })();
 
@@ -382,14 +414,22 @@ async function main() {
     }
 
     const env = makeEnv(secrets, repo);
-    if (argv.setupSonatype) {
-        console.log("Setting up sonatype secrets...")
-        await setupSbtSonatype(env);
-    }
     if (argv.setupNuget) {
         console.log("Adding nuget key...")
         await setupNuget(env);
     }
+
+    if (argv.setupCodecov) {
+        console.log("Adding codecov key...")
+        await setupCodecov(env);
+    }
+
+    if (argv.setupSonatype) {
+        console.log("Setting up sonatype secrets...")
+        await setupSbtSonatypeKeys(env);
+        await setupSbtSonatype(env);
+    }
+
 }
 
 main()
