@@ -351,15 +351,7 @@ async function setupToken(env: Env, name: string, value: string) {
 }
 
 async function main() {
-    var opts = {
-        owner: { type: 'string', demandOption: true },
-        repo: { type: 'string', demandOption: true },
-        readVault: { type: 'boolean', default: true },
-        vaultPath: { type: 'string', default: "ghpub/data" },
-        vaultAddress: { type: 'string', default: process.env.VAULT_ADDR ?? "" },
-        writeVault: { type: 'boolean', default: false },
-        sonatype: { type: 'boolean', default: true },
-    };
+    var opts = {};
 
     for (let t in TOKENS) {
         const token = TOKENS[t];
@@ -371,7 +363,15 @@ async function main() {
         }
     };
 
-    const argv = await yargs(hideBin(process.argv)).options(opts).argv;
+    const argv = await yargs(hideBin(process.argv)).options({
+        owner: { type: 'string', demandOption: true },
+        repo: { type: 'string', demandOption: true },
+        readVault: { type: 'boolean', default: true },
+        vaultPath: { type: 'string', default: "ghpub/data" },
+        vaultAddress: { type: 'string', default: process.env.VAULT_ADDR ?? "" },
+        writeVault: { type: 'boolean', default: false },
+        sonatype: { type: 'boolean', default: true },
+    }).options(opts).argv;
 
     const repo = {
         owner: argv.owner,
@@ -413,7 +413,7 @@ async function main() {
                     tokens.add(token.name);
                 }
             };
-            return readSecrets(argv.setupSonatype, tokens);
+            return readSecrets(argv.sonatype, tokens);
         }
     })();
 
