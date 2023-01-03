@@ -27,13 +27,18 @@ function panic(clue: string) {
 }
 
 
+const TOKENS = [
+    { name: "nuget", secret: "TOKEN_NUGET", allowSet: true },
+    { name: "codecov", secret: "TOKEN_CODECOV", allowSet: true },
+    { name: "npm", secret: "TOKEN_NPM", allowSet: true },
+    { name: "github", secret: "TOKEN_GITHUB", allowSet: false },
+]
+
 type Secrets = {
-    githubKey: string;
     sonatypeLogin: string;
     sonatypePassword: string;
     sonatypeEmail: string;
-    nugetToken: string;
-    codecovToken: string;
+    tokens: any
 }
 async function readVault(endpoint: string, path: string): Promise<Secrets> {
     const vault = vaultClient({
@@ -47,19 +52,25 @@ async function readVault(endpoint: string, path: string): Promise<Secrets> {
         panic("VAULT_TOKEN variable is unset");
     }
 
-    //console.debug(await vault.write(`${path}/test`, { data: { key: "value" } }));
-
     const sonatype = (await vault.read(`${path}/sonatype`)).data;
+
+    var tokenVals = {}
+    for (let t in TOKENS) {
+        const token = TOKENS[t];
+        const tval = {
+            [token.name]: { value: (await vault.read(`${path}/${token.name}`)).data.data.token, secret: token.secret, allow: token.allowSet }
+        };
+        Object.assign(tokenVals, tval);
+    };
 
     return {
         sonatypeLogin: sonatype.data.user,
         sonatypePassword: sonatype.data.password,
         sonatypeEmail: sonatype.data.email,
-        githubKey: (await vault.read(`${path}/github`)).data.data.token,
-        nugetToken: (await vault.read(`${path}/nuget`)).data.data.token,
-        codecovToken: (await vault.read(`${path}/codecov`)).data.data.token,
+        tokens: tokenVals,
     }
-};
+}
+
 async function writeVault(endpoint: string, path: string, secrets: Secrets): Promise<void> {
     const vault = vaultClient({
         apiVersion: "v1",
@@ -72,8 +83,11 @@ async function writeVault(endpoint: string, path: string, secrets: Secrets): Pro
     }
 
     await vault.write(`${path}/sonatype`, { data: { user: secrets.sonatypeLogin, password: secrets.sonatypePassword, email: secrets.sonatypeEmail } });
-    await vault.write(`${path}/github`, { data: { token: secrets.githubKey } });
-    await vault.write(`${path}/nuget`, { data: { token: secrets.nugetToken } });
+
+    for (let t in TOKENS) {
+        const token = TOKENS[t];
+        await vault.write(`${path}/${token.name}`, { data: { token: secrets.tokens[token.name].value } });
+    };
 };
 
 async function readSecret(name: string) {
@@ -98,14 +112,10 @@ async function readInput(name: string) {
     ]);
     return out.input;
 }
-async function readSecrets(sonatype: boolean, nuget: boolean, codecov: boolean): Promise<Secrets> {
-
+async function readSecrets(sonatype: boolean, tokens: Set<string>): Promise<Secrets> {
     var sonatypeUser = "";
     var sonatypeEmail = "";
     var sonatypePassword = "";
-
-    var nugetToken = "";
-    var codecovToken = "";
 
     const githubKey = await readSecret("Github Token");
 
@@ -114,19 +124,21 @@ async function readSecrets(sonatype: boolean, nuget: boolean, codecov: boolean):
         sonatypeEmail = await readInput("Sonatype email");
         sonatypePassword = await readSecret("Sonatype Password");
     }
-    if (nuget) {
-        nugetToken = await readSecret("Nuget Token");
-    }
-    if (codecov) {
-        codecovToken = await readSecret("Codecov Token");
-    }
+
+    var tokenVals = {};
+    for (let t in TOKENS) {
+        const token = TOKENS[t];
+        const tval = {
+            [token.name]: { value: (await readSecret(`${token} token`)), secret: token.secret, allow: token.allowSet }
+        };
+        Object.assign(tokenVals, tval);
+    };
+
     return {
         sonatypeLogin: sonatypeUser,
         sonatypePassword: sonatypePassword,
         sonatypeEmail: sonatypeEmail,
-        githubKey: githubKey,
-        nugetToken: nugetToken,
-        codecovToken: codecovToken,
+        tokens: tokenVals
     }
 };
 
@@ -138,7 +150,7 @@ type Repo = {
 
 function makeEnv(secrets: Secrets, repo: Repo) {
     return {
-        octokit: new Octokit({ auth: secrets.githubKey }),
+        octokit: new Octokit({ auth: secrets.tokens.github.value }),
         sodium: libsodium,
         repo: repo,
         secrets: secrets,
@@ -331,32 +343,35 @@ async function setupSbtSonatype(env: Env) {
     }
 }
 
-async function setupNuget(env: Env) {
-    console.log(`Setting up nuget token...`);
+async function setupToken(env: Env, name: string, value: string) {
+    console.log(`Setting up ${name} token...`);
     const rpk = await getRepoKey(env);
-    await setupSecret(rpk, "TOKEN_NUGET", env.secrets.nugetToken, env);
-    console.log("...done")
-}
-
-async function setupCodecov(env: Env) {
-    console.log(`Setting up nuget token...`);
-    const rpk = await getRepoKey(env);
-    await setupSecret(rpk, "TOKEN_CODECOV", env.secrets.codecovToken, env);
+    await setupSecret(rpk, name, value, env);
     console.log("...done")
 }
 
 async function main() {
-    const argv = await yargs(hideBin(process.argv)).options({
+    var opts = {
         owner: { type: 'string', demandOption: true },
         repo: { type: 'string', demandOption: true },
         readVault: { type: 'boolean', default: true },
-        setupSonatype: { type: 'boolean', default: true },
-        setupNuget: { type: 'boolean', default: true },
-        setupCodecov: { type: 'boolean', default: true },
         vaultPath: { type: 'string', default: "ghpub/data" },
         vaultAddress: { type: 'string', default: process.env.VAULT_ADDR ?? "" },
         writeVault: { type: 'boolean', default: false },
-    }).argv;
+        sonatype: { type: 'boolean', default: true },
+    };
+
+    for (let t in TOKENS) {
+        const token = TOKENS[t];
+        const tval = {
+            [`${token.name}`]: { type: 'boolean', default: true }
+        };
+        if (token.allowSet) {
+            Object.assign(opts, tval);
+        }
+    };
+
+    const argv = await yargs(hideBin(process.argv)).options(opts).argv;
 
     const repo = {
         owner: argv.owner,
@@ -365,16 +380,18 @@ async function main() {
 
     console.log(`* Will operate on ${JSON.stringify(repo)}`);
 
-    if (argv.setupSonatype) {
+    if (argv.sonatype) {
         console.log("* Will commit encrypted Sonatype secrets archive");
         console.log("* Will add decryption tokens into Github secrets");
     }
-    if (argv.setupNuget) {
-        console.log("* Will add Nuget token into Github secrets");
-    }
-    if (argv.setupCodecov) {
-        console.log("* Will add Codecov token into Github secrets");
-    }
+
+    for (let t in TOKENS) {
+        const token = TOKENS[t];
+        if (token.allowSet && argv[token.name]) {
+            console.log(`* Will add ${token.name} token into Github secrets`);
+        }
+    };
+
     if (argv.readVault) {
         if (argv.vaultAddress.length == 0) {
             panic("VAULT_ADDR variable is unset");
@@ -389,7 +406,14 @@ async function main() {
         if (argv.readVault) {
             return readVault(argv.vaultAddress, argv.vaultPath);
         } else {
-            return readSecrets(argv.setupSonatype, argv.setupNuget, argv.setupCodecov);
+            var tokens = new Set<string>();
+            for (let t in TOKENS) {
+                const token = TOKENS[t];
+                if (argv[token.name]) {
+                    tokens.add(token.name);
+                }
+            };
+            return readSecrets(argv.setupSonatype, tokens);
         }
     })();
 
@@ -414,22 +438,19 @@ async function main() {
     }
 
     const env = makeEnv(secrets, repo);
-    if (argv.setupNuget) {
-        console.log("Adding nuget key...")
-        await setupNuget(env);
-    }
 
-    if (argv.setupCodecov) {
-        console.log("Adding codecov key...")
-        await setupCodecov(env);
-    }
+    for (let t in TOKENS) {
+        const token = TOKENS[t];
+        if (token.allowSet && argv[token.name]) {
+            await setupToken(env, token.secret, secrets.tokens[token.name].value);
+        }
+    };
 
-    if (argv.setupSonatype) {
+    if (argv.sonatype) {
         console.log("Setting up sonatype secrets...")
         await setupSbtSonatypeKeys(env);
         await setupSbtSonatype(env);
     }
-
 }
 
 main()
